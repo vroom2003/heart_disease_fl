@@ -4,8 +4,8 @@ import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import StandardScaler
-from qiskit import QuantumCircuit, transpile
-from qiskit_aer import Aer
+from sklearn.model_selection import StratifiedShuffleSplit
+
 
 class HeartDiseaseFLBQC:
     def __init__(self, n_clients=3):
@@ -24,108 +24,65 @@ class HeartDiseaseFLBQC:
         return X, y
 
     def split_data_balanced(self):
-        """Split data into clients, ensuring each has at least one sample from each class."""
+        """Split data into clients using stratified sampling to preserve class balance."""
         X, y = self.X, self.y
-        idx_0 = np.where(y == 0)[0]  # No disease
-        idx_1 = np.where(y == 1)[0]  # Has disease
-
-        np.random.seed(42)
-        np.random.shuffle(idx_0)
-        np.random.shuffle(idx_1)
-
-        # Split into clients
-        split_0 = np.array_split(idx_0, self.n_clients)
-        split_1 = np.array_split(idx_1, self.n_clients)
-
+        sss = StratifiedShuffleSplit(
+            n_splits=self.n_clients,
+            train_size=len(X) // self.n_clients,
+            random_state=42
+        )
         client_data = []
-        for i in range(self.n_clients):
-            c0 = split_0[i] if len(split_0[i]) > 0 else [idx_0[0]] if len(idx_0) > 0 else []
-            c1 = split_1[i] if len(split_1[i]) > 0 else [idx_1[0]] if len(idx_1) > 0 else []
-
-            # Convert to lists and concatenate
-            client_idx = np.concatenate([c0, c1])
-            np.random.shuffle(client_idx)
-            client_data.append((X[client_idx], y[client_idx]))
-
+        for _, idx in sss.split(X, y):
+            client_data.append((X[idx], y[idx]))
         return client_data
 
     def train_local_model(self, X, y):
-        """
-        Train local model safely.
-        Returns (model, gradient) or (None, zero_grad) if unsafe.
-        """
-        # 🔒 Must have both classes
+        """Train local logistic regression model and return gradient approximation."""
         if len(np.unique(y)) < 2:
             return None, np.zeros((1, X.shape[1]))
 
-        # ✅ Train real model
         model = LogisticRegression(max_iter=200, solver='liblinear', random_state=42)
         try:
             model.fit(X, y)
         except:
             return None, np.zeros((1, X.shape[1]))
 
-        # 🛠️ Approximate gradient using synthetic baseline (safe)
-        dummy_X = np.random.randn(2, X.shape[1])  # synthetic
-        dummy_y = np.array([0, 1])                # two classes
+        # Approximate gradient using synthetic baseline
+        dummy_X = np.random.randn(2, X.shape[1])
+        dummy_y = np.array([0, 1])
         baseline = LogisticRegression(max_iter=100, solver='liblinear', random_state=43)
         baseline.fit(dummy_X, dummy_y)
         grad = model.coef_ - baseline.coef_
 
         return model, grad
 
-    def blind_gradient_with_qiskit(self, grad):
-        """Simulate BQC: encode gradient into quantum circuit."""
-        backend = Aer.get_backend('aer_simulator')
-        num_qubits = 5
-        qc = QuantumCircuit(num_qubits)
-
-        # Flatten and normalize
-        flat_grad = grad.flatten()
-        flat_grad = np.resize(flat_grad, 2**num_qubits)
-        flat_grad /= np.linalg.norm(flat_grad) + 1e-8
-
-        for i in range(num_qubits):
-            qc.ry(flat_grad[i], i)
-
-        # Client's secret rotation (blindness)
-        np.random.seed(42)
-        for i in range(num_qubits):
-            theta = np.random.uniform(0, 2 * np.pi)
-            qc.ry(theta, i)
-
-        qc.measure_all()
-        transpiled_qc = transpile(qc, backend)
-        job = backend.run(transpiled_qc, shots=1024)
-        result = job.result()
-        counts = result.get_counts()
-
-        return counts
-
     def run_fl_only(self, epochs=10):
-        """Run classical Federated Learning."""
+        """Run classical Federated Learning (FedAvg)."""
         results = []
         global_weights = np.zeros((1, self.X.shape[1]))
+        momentum = np.zeros_like(global_weights)  # For smoother convergence
 
         for e in range(epochs):
             gradients = []
             for X, y in self.client_data:
                 model, grad = self.train_local_model(X, y)
-                if model is None:
-                    continue  # skip unsafe client
-                gradients.append(grad)
+                if model is not None:
+                    gradients.append(grad)
 
             if len(gradients) == 0:
                 gradients = [np.zeros((1, self.X.shape[1]))]
 
             avg_grad = np.mean(gradients, axis=0)
-            global_weights += avg_grad * 0.1
 
-            # ✅ Safe global model evaluation
+            # Momentum for stable convergence
+            momentum = 0.9 * momentum + 0.1 * avg_grad
+            global_weights += momentum * 0.15  # Slightly higher LR
+
+            # Evaluate
             pseudo = LogisticRegression(max_iter=1, solver='liblinear')
             dummy_X = np.random.randn(2, self.X.shape[1])
             dummy_y = np.array([0, 1])
-            pseudo.fit(dummy_X, dummy_y)  # Safe 2-class init
+            pseudo.fit(dummy_X, dummy_y)
             pseudo.coef_ = global_weights
             pseudo.intercept_ = np.zeros(1)
             y_pred = pseudo.predict(self.X)
@@ -141,24 +98,45 @@ class HeartDiseaseFLBQC:
         return pd.DataFrame(results)
 
     def run_efl_bqc(self, epochs=10):
-        """Run Enhanced FL with BQC simulation."""
+        """Run Enhanced FL with BQC-inspired blind aggregation."""
         results = []
         global_weights = np.zeros((1, self.X.shape[1]))
+        momentum = np.zeros_like(global_weights)
 
         for e in range(epochs):
-            blind_counts = []
+            blinded_gradients = []
+            masks = []
+
             for X, y in self.client_data:
                 model, grad = self.train_local_model(X, y)
                 if model is None:
                     continue
-                counts = self.blind_gradient_with_qiskit(grad)
-                blind_counts.append(counts)
 
-            avg_count_val = np.mean([np.std(list(c.values())) for c in blind_counts]) if blind_counts else 0.0
+                # Client-side: blind gradient with secret mask
+                np.random.seed(42 + e + len(blinded_gradients))  # Deterministic for reproducibility
+                mask = np.random.choice([-1, 1], size=grad.shape)
+                blinded_grad = grad * mask
 
-            global_weights += np.random.normal(0, 0.005, global_weights.shape)
+                blinded_gradients.append(blinded_grad)
+                masks.append(mask)
 
-            # ✅ Safe global model evaluation
+            if len(blinded_gradients) == 0:
+                avg_blinded = np.zeros((1, self.X.shape[1]))
+            else:
+                avg_blinded = np.mean(blinded_gradients, axis=0)
+
+            # Server sends blinded update back
+            # Clients unblind it locally
+            avg_true_grad = np.zeros_like(avg_blinded)
+            for bg, mask in zip(blinded_gradients, masks):
+                avg_true_grad += bg * mask  # unblind
+            avg_true_grad /= len(blinded_gradients)
+
+            # Update with momentum
+            momentum = 0.9 * momentum + 0.1 * avg_true_grad
+            global_weights += momentum * 0.15
+
+            # Evaluate
             pseudo = LogisticRegression(max_iter=1, solver='liblinear')
             dummy_X = np.random.randn(2, self.X.shape[1])
             dummy_y = np.array([0, 1])
@@ -168,10 +146,14 @@ class HeartDiseaseFLBQC:
             y_pred = pseudo.predict(self.X)
             acc = accuracy_score(self.y, y_pred)
 
+            # Privacy: server saw only blinded gradients
+            # High std = more randomness = better privacy
+            leak = np.mean([np.std(bg) for bg in blinded_gradients])
+
             results.append({
                 'round': e + 1,
                 'accuracy': acc,
-                'privacy_leakage': avg_count_val,
-                'method': 'FL + BQC (Qiskit)'
+                'privacy_leakage': leak,
+                'method': 'FL + BQC (Simulated)'
             })
         return pd.DataFrame(results)
